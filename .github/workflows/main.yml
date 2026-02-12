@@ -1,0 +1,24 @@
+name: Fz-Data-Sync
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pythonセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 依存関係インストール
+        run: |
+          pip install playwright requests
+          playwright install chromium
+      - name: 実行
+        env:
+          GAS_URL: ${{ secrets.GAS_URL }}
+        run: python main.py
