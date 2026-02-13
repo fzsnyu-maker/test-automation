@@ -13,90 +13,81 @@ def run():
     try:
         res = requests.get(f"{GAS_URL}?action=get_urls")
         urls = res.json()
+        print(f"Target URLs: {urls}")
     except Exception as e:
         print(f"Failed to fetch URLs: {e}")
         return
 
-    if not urls:
-        print("No URLs found. Stopping.")
-        return
-
     with sync_playwright() as p:
+        # ブラウザの起動オプションを強化
         browser = p.chromium.launch(headless=True)
-        # より人間に近いブラウザ偽装
+        
+        # 徹底的な「人間（日本人）」の偽装
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={'width': 1280, 'height': 800}
+            locale="ja-JP",
+            timezone_id="Asia/Tokyo",
+            viewport={'width': 1920, 'height': 1080}
         )
+        
         page = context.new_page()
         
         for url in urls:
             try:
-                # 対策1: 直接「出勤情報」のページを狙う（トップページだとiframe等で隠されるため）
-                target_url = url.rstrip('/') + "/attend/"
-                print(f"Scraping Target: {target_url}")
+                print(f"Accessing: {url}")
+                # タイムアウトを極限まで伸ばし、ネットワークが静かになるまで待つ
+                page.goto(url, wait_until="load", timeout=90000)
                 
-                # 対策2: タイムアウトを長めに設定
-                page.goto(target_url, wait_until="networkidle", timeout=60000)
+                # シティヘブンの動的ロードを待つために、数回スクロール
+                for _ in range(3):
+                    page.mouse.wheel(0, 500)
+                    page.wait_for_timeout(1000)
                 
-                # 対策3: ページを一番下までスクロールして「後読み込み」を強制起動させる
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(5000) 
+                # 少し長めに待機（重要）
+                page.wait_for_timeout(5000)
 
                 girls_data = []
                 processed_ids = set()
 
-                # 対策4: シティヘブンの「予約表（table）」や「キャストBOX」を広範囲にスキャン
-                # aタグのhref属性を全て取得
-                elements = page.query_selector_all("a[href*='girlid-']")
+                # 手法1: href属性の全スキャン（正規表現）
+                # ページ全体のHTMLを取得して直接IDをぶっこ抜く
+                content = page.content()
+                all_girl_ids = re.findall(r"girlid-(\d+)", content)
                 
-                for el in elements:
-                    href = el.get_attribute("href")
-                    match = re.search(r"girlid-(\d+)", href)
-                    if not match: continue
+                if all_girl_ids:
+                    print(f"Found {len(set(all_girl_ids))} IDs by Regex Scan.")
                     
-                    girl_id = match.group(1)
-                    if girl_id in processed_ids: continue
-                    processed_ids.add(girl_id)
-
-                    # 近くにある名前とステータスを探す
-                    # aタグ自体のテキストか、その親のテキストを判定
-                    parent = el.evaluate_handle("el => { \
-                        let p = el.closest('tr, li, div[class*=\"cast\"], div[class*=\"girl\"]'); \
-                        return p ? p : el.parentElement; \
-                    }").as_element()
-
-                    if parent:
-                        full_text = parent.inner_text().replace('\n', ' ')
-                        name = el.inner_text().strip()
-                        if not name or len(name) > 10: # 名前が長すぎる場合は別の場所を探す
-                             name_el = parent.query_selector(".name, dt, b")
-                             name = name_el.inner_text().strip() if name_el else name
-
-                        status = "不明"
-                        if any(x in full_text for x in ["案内終了", "受付終了", "本日終了"]):
-                            status = "案内終了"
-                        elif any(x in full_text for x in ["予約満了", "満員", "完売"]):
-                            status = "予約満了"
-                        elif any(x in full_text for x in ["×", "TEL", "接客中"]):
-                            status = "接客中"
-                        elif any(x in full_text for x in ["○", "待機", "即案内"]):
-                            status = "待機中"
-                        else:
+                    for gid in set(all_girl_ids):
+                        # 各IDに対して、名前とステータスを特定しにいく
+                        # ページ内のそのIDを持つaタグを探す
+                        el = page.query_selector(f"a[href*='girlid-{gid}']")
+                        if el:
+                            # 親要素を取得
+                            parent = el.evaluate_handle("el => el.closest('div, li, tr')").as_element()
+                            name = "調査中"
                             status = "出勤中"
+                            
+                            if parent:
+                                p_text = parent.inner_text().replace('\n', ' ')
+                                # 名前の推測
+                                name = el.inner_text().strip()
+                                # ステータスの推測
+                                if "終了" in p_text or "受付不可" in p_text: status = "案内終了"
+                                elif "満了" in p_text or "満員" in p_text: status = "予約満了"
+                                elif "×" in p_text or "TEL" in p_text: status = "接客中"
+                                elif "○" in p_text or "即" in p_text: status = "待機中"
+                            
+                            girls_data.append({"id": gid, "name": name, "status": status})
 
-                        girls_data.append({"id": girl_id, "name": name, "status": status})
-
-                # 最終手段：それでも0件ならiframeの中を覗く
+                # 手法2: それでもダメなら「隠し要素」を全検索
                 if not girls_data:
-                    print("Checking iframes...")
-                    for frame in page.frames:
-                        f_elements = frame.query_selector_all("a[href*='girlid-']")
-                        for fel in f_elements:
-                            f_href = fel.get_attribute("href")
-                            f_match = re.search(r"girlid-(\d+)", f_href)
-                            if f_match:
-                                girls_data.append({"id": f_match.group(1), "name": fel.inner_text().strip(), "status": "iframe検知"})
+                    print("Attempting to find hidden data-attributes...")
+                    elements = page.query_selector_all("[data-girl_id]")
+                    for el in elements:
+                        gid = el.get_attribute("data-girl_id")
+                        if gid and gid not in processed_ids:
+                            processed_ids.add(gid)
+                            girls_data.append({"id": gid, "name": "データ検知", "status": "不明"})
 
                 print(f"Sending {len(girls_data)} girls to GAS...")
                 requests.post(GAS_URL, data={
@@ -107,7 +98,7 @@ def run():
                 })
 
             except Exception as e:
-                print(f"Error: {e}")
+                print(f"Error during scraping: {e}")
                 
         browser.close()
 
