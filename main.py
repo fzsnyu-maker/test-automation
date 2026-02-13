@@ -19,79 +19,78 @@ def run():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
+        # コンテキスト設定でiPhoneを完全にシミュレート
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", # スマホ版に偽装
+            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            viewport={'width': 375, 'height': 812},
             locale="ja-JP"
         )
         page = context.new_page()
         
         for url in urls:
             try:
-                # 対策：店舗トップではなく、必ず存在する「出勤スケジュールページ」を狙う
-                # ここはPC版よりも構造が単純で、データが抜きやすい
-                base_url = url.rstrip('/')
-                target_url = f"{base_url}/attend/"
-                print(f"Targeting Attendance Page: {target_url}")
+                # 対策1: URLに ?pcmode=sp を付与してスマホ版を強制
+                base_url = url.split('?')[0].rstrip('/')
+                target_url = f"{base_url}/attend/?pcmode=sp"
+                print(f"Targeting SP Mode: {target_url}")
                 
                 page.goto(target_url, wait_until="load", timeout=60000)
-                page.wait_for_timeout(7000) # 読み込みをしっかり待つ
+                
+                # 対策2: スマホ版はスクロールでデータが読み込まれることが多いため、少しずつ下げる
+                for i in range(5):
+                    page.mouse.wheel(0, 800)
+                    page.wait_for_timeout(1000)
 
                 girls_data = []
-                
-                # 手法：HTML全体から girlid を含む全てのブロック（trやdiv）を抽出
-                # シティヘブンの attend ページは table 構造が多いため、それを中心に解析
-                rows = page.query_selector_all("tr, .cast_box, .girl_list_box")
-                print(f"Found {len(rows)} potential rows.")
+                processed_ids = set()
 
-                for row in rows:
-                    link = row.query_selector("a[href*='girlid-']")
-                    if not link:
-                        continue
-                    
+                # 対策3: スマホ版のHTML構造（aタグのgirlid）を全スキャン
+                # スマホ版はリスト形式なので、aタグを起点にするのが最も確実
+                links = page.query_selector_all("a[href*='girlid-']")
+                print(f"Found {len(links)} candidate links.")
+
+                for link in links:
                     href = link.get_attribute("href")
-                    girl_id = re.search(r"girlid-(\d+)", href).group(1)
+                    match = re.search(r"girlid-(\d+)", href)
+                    if not match: continue
                     
-                    # すでに同じIDを取得済みならスキップ
-                    if any(g['id'] == girl_id for g in girls_data):
-                        continue
+                    girl_id = match.group(1)
+                    if girl_id in processed_ids: continue
+                    processed_ids.add(girl_id)
 
-                    name = link.inner_text().strip()
-                    # 名前が空の場合や「詳細」などの場合は、隣の要素を探す
-                    if not name or len(name) < 2:
-                        name_el = row.query_selector(".name, b, strong")
-                        name = name_el.inner_text().strip() if name_el else "不明"
+                    # 近くの親要素（divやli）を取得して、その中のテキストを解析
+                    parent = link.evaluate_handle("el => el.closest('div, li, section')").as_element()
+                    
+                    if parent:
+                        parent_text = parent.inner_text().replace('\n', ' ')
+                        # 名前の取得（aタグ内、または特定のクラス）
+                        name = link.inner_text().strip()
+                        if not name or len(name) > 15: # 変なテキストを拾った場合の予備
+                            name_el = parent.query_selector("[class*='name']")
+                            name = name_el.inner_text().strip() if name_el else "不明"
 
-                    # ステータス判定（行全体のテキストから判断）
-                    row_text = row.inner_text().replace('\n', '')
-                    status = "不明"
-                    if "終了" in row_text or "受付不可" in row_text:
-                        status = "案内終了"
-                    elif "満了" in row_text or "満員" in row_text:
-                        status = "予約満了"
-                    elif "×" in row_text or "TEL" in row_text or "接客" in row_text:
-                        status = "接客中"
-                    elif "○" in row_text or "待機" in row_text or "即" in row_text or "空き" in row_text:
-                        status = "待機中"
-                    else:
-                        status = "出勤中"
+                        # ステータス判定
+                        status = "不明"
+                        if any(x in parent_text for x in ["終了", "受付不可", "本日完売"]):
+                            status = "案内終了"
+                        elif any(x in parent_text for x in ["予約満了", "満員", "完売"]):
+                            status = "予約満了"
+                        elif any(x in parent_text for x in ["×", "TEL", "接客中"]):
+                            status = "接客中"
+                        elif any(x in parent_text for x in ["○", "待機", "即案内", "空き"]):
+                            status = "待機中"
+                        else:
+                            status = "出勤中"
 
-                    girls_data.append({
-                        "id": girl_id,
-                        "name": name,
-                        "status": status
-                    })
+                        girls_data.append({"id": girl_id, "name": name, "status": status})
 
-                # --- 最終手段：もし0件なら、スマホ版URLへ切り替えて再トライ ---
+                # 万が一0件だった場合のバックアップ（ページ全体のHTMLからIDだけ抜く）
                 if not girls_data:
-                    print("No girls found. Trying Mobile URL...")
-                    sp_url = base_url.replace("www.", "m.") + "/attend/"
-                    page.goto(sp_url, wait_until="networkidle")
-                    page.wait_for_timeout(5000)
-                    # 同様のロジックで再スキャン（省略するが、page.content()からの正規表現抜き出し等）
+                    print("Backup: Regex Scan for SP content...")
                     content = page.content()
-                    sp_ids = re.findall(r"girlid-(\d+)", content)
-                    for sid in set(sp_ids):
-                        girls_data.append({"id": sid, "name": "SP検知", "status": "確認中"})
+                    ids = set(re.findall(r"girlid-(\d+)", content))
+                    for gid in ids:
+                        girls_data.append({"id": gid, "name": "SP検知", "status": "確認中"})
 
                 print(f"Sending {len(girls_data)} girls to GAS...")
                 requests.post(GAS_URL, data={
