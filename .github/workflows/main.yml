@@ -1,4 +1,4 @@
-name: CityHeaven Scraper Control
+name: Data Analysis System
 
 on:
   schedule:
