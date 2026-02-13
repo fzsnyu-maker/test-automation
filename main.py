@@ -2,79 +2,69 @@ import os
 import requests
 import json
 import re
-from datetime import datetime, timedelta
 from playwright.sync_api import sync_playwright
 
-# --- 設定エリア ---
 GAS_URL = os.environ.get("GAS_URL")
 
-def get_target_urls():
-    # GASから店舗URLリストを取得
-    res = requests.get(f"{GAS_URL}?action=get_urls")
-    return res.json()
-
-def scrape_store(page, store_url, mode):
-    # 出勤情報ページURLを生成
-    list_url = store_url.rstrip('/') + "/girl_list/"
-    page.goto(list_url)
-    
-    results = []
-    girls = page.query_selector_all(".girl_list_box") # 店舗ページ構成に依存
-
-    for girl in girls:
-        # 基本情報取得
-        name = girl.query_selector(".name").inner_text()
-        girl_url = girl.query_selector("a").get_attribute("href")
-        girl_id = re.search(r"girlid-(\d+)", girl_url).group(1)
-        
-        # 予約状況（通常巡回）
-        status_text = girl.query_selector(".status").inner_text() # 「受付終了」など
-        
-        deep_data = {}
-        if mode == "deep":
-            # 深層スキャン：プロフィールへ移動
-            page.goto(girl_url)
-            # 動画撮影/AV判定ロジック
-            body_text = page.inner_text("body")
-            deep_data['av'] = "◯" if re.search(r"(AV女優|セクシー女優|AV出演)", body_text) else ""
-            deep_data['video'] = "◯" if re.search(r"(動画撮影|ビデオ撮影|撮影可)", body_text) else ""
-            
-            # 口コミ数
-            review_link = girl_url + "reviews/"
-            page.goto(review_link)
-            review_text = page.inner_text(".review_count") # 例: "27件"
-            deep_data['reviews'] = re.sub(r"\D", "", review_text)
-            
-            # 1週間シフト
-            shift_data = page.query_selector(".schedule_box").inner_text()
-            deep_data['shift'] = shift_data
-
-        results.append({
-            "id": girl_id,
-            "name": name,
-            "status": status_text,
-            "deep": deep_data
-        })
-    return results
-
 def run():
-    urls = get_target_urls()
-    # モード判定（GitHub Actionsの引数などで切り替え）
-    mode = os.environ.get("SCAN_MODE", "normal") 
+    mode = os.environ.get("SCAN_MODE", "normal")
     
+    # 1. GASからURLを取得
+    print(f"Connecting to GAS: {GAS_URL}")
+    try:
+        res = requests.get(f"{GAS_URL}?action=get_urls")
+        urls = res.json()
+        print(f"Fetched URLs: {urls}") # ここで取得したURLがログに出ます
+    except Exception as e:
+        print(f"Failed to fetch URLs from GAS: {e}")
+        return
+
+    if not urls:
+        print("No URLs found in the '設定' sheet (Column Q). Stopping.")
+        return
+
     with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+        page = context.new_page()
         
         for url in urls:
-            data = scrape_store(page, url, mode)
-            # GASへ送信
-            requests.post(GAS_URL, data={
-                "action": "sync_data",
-                "mode": mode,
-                "url": url,
-                "data": json.dumps(data)
-            })
+            try:
+                print(f"Scraping Store: {url}")
+                # 巡回処理
+                list_url = url.rstrip('/') + "/girl_list/"
+                page.goto(list_url, wait_until="domcontentloaded")
+                
+                girls_data = []
+                # シティヘブンの女の子リストの要素を特定（クラス名は調整が必要な場合があります）
+                # 今回はより汎用的なセレクタに変更
+                girl_elements = page.query_selector_all("[class*='girl_list_box']")
+                
+                for el in girl_elements:
+                    name = el.query_selector("[class*='name']").inner_text() if el.query_selector("[class*='name']") else "Unknown"
+                    status = el.query_selector("[class*='status']").inner_text() if el.query_selector("[class*='status']") else ""
+                    girl_link = el.query_selector("a").get_attribute("href") if el.query_selector("a") else ""
+                    girl_id = re.search(r"girlid-(\d+)", girl_link).group(1) if girl_link else "0"
+                    
+                    girls_data.append({
+                        "id": girl_id,
+                        "name": name,
+                        "status": status.replace('\n', ' ')
+                    })
+                
+                # GASへ送信
+                print(f"Sending {len(girls_data)} girls to GAS...")
+                post_res = requests.post(GAS_URL, data={
+                    "action": "sync_data",
+                    "mode": mode,
+                    "store_url": url,
+                    "json_data": json.dumps(girls_data, ensure_ascii=False)
+                })
+                print(f"GAS Response: {post_res.text}")
+
+            except Exception as e:
+                print(f"Error scraping {url}: {e}")
+                
         browser.close()
 
 if __name__ == "__main__":
